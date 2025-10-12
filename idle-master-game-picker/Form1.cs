@@ -1,14 +1,16 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Microsoft.Win32; // for MachineGuid entropy
 
 namespace idle_master_game_picker
 {
@@ -18,15 +20,34 @@ namespace idle_master_game_picker
         private readonly TextBox txtApiKey = new() { PlaceholderText = "Steam Web API key", Width = 280 };
         private readonly TextBox txtIdentity = new() { PlaceholderText = "SteamID64 OR profile URL OR vanity name", Width = 420 };
         private readonly Button btnFetch = new() { Text = "Fetch games" };
-        private readonly TextBox txtSearch = new() { PlaceholderText = "Search games�", Width = 260 };
+        private readonly TextBox txtSearch = new() { PlaceholderText = "Search games…", Width = 260 };
         private readonly Button btnSelectAll = new() { Text = "Select all (visible)" };
         private readonly Button btnDeselectAll = new() { Text = "Deselect all (visible)" };
         private readonly Button btnClearAll = new() { Text = "Clear all selections" };
         private readonly CheckedListBox clbGames = new() { Dock = DockStyle.Fill, CheckOnClick = true };
 
-        // --- Bottom controls ---
+        // Small top-row “Forget” and its help button (near the API key)
+        private readonly Button btnForgetTop = new() { Text = "Forget", Width = 74, Height = 28 };
+        private readonly Button btnForgetHelp = new()
+        {
+            Text = "?",
+            Width = 28,
+            Height = 28,
+            FlatStyle = FlatStyle.Flat,
+            Margin = new Padding(2, 2, 0, 0)
+        };
+
+        // --- Bottom controls (no Forget button here) ---
         private readonly Button btnImportCsv = new() { Text = "Import selections (.csv)" };
         private readonly Button btnExport = new() { Text = "Export (games.ps1 + start.bat + selected_games.csv)" };
+        private readonly Button btnImportHelp = new()
+        {
+            Text = "?",
+            Width = 28,
+            Height = 28,
+            FlatStyle = FlatStyle.Flat,
+            Margin = new Padding(2, 2, 0, 0)
+        };
         private readonly Label lblStatus = new() { AutoSize = true };
 
         // --- Advanced parameter controls ---
@@ -58,8 +79,15 @@ namespace idle_master_game_picker
             ReshowDelay = 100
         };
 
+        // --- In-memory state ---
         private List<Game> allGames = new();
         private readonly HashSet<int> selectedAppIds = new(); // persistent selection across filters
+
+        // --- Reused HttpClient to avoid socket exhaustion ---
+        private static readonly HttpClient Http = new()
+        {
+            Timeout = TimeSpan.FromSeconds(30)
+        };
 
         public Form1()
         {
@@ -68,6 +96,9 @@ namespace idle_master_game_picker
             Width = 980;
             Height = 720;
             StartPosition = FormStartPosition.CenterScreen;
+
+            // Optional: set a User-Agent so your requests are easy to identify server-side
+            try { Http.DefaultRequestHeaders.UserAgent.ParseAdd("IdleMasterGamePicker/1.0 (+winforms)"); } catch { }
 
             // Layout root
             var tlp = new TableLayoutPanel
@@ -87,6 +118,14 @@ namespace idle_master_game_picker
             var top = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Dock = DockStyle.Fill };
             top.Controls.Add(new Label { Text = "API key:", AutoSize = true, Padding = new Padding(0, 6, 6, 0) });
             top.Controls.Add(txtApiKey);
+
+            // Mask API key visually so it appears like a password field (********)
+            txtApiKey.UseSystemPasswordChar = true;
+
+            // Add small "Forget" + "?" near the API key
+            top.Controls.Add(btnForgetTop);
+            top.Controls.Add(btnForgetHelp);
+
             top.Controls.Add(new Label { Text = "Steam ID / URL / Vanity:", AutoSize = true, Padding = new Padding(12, 6, 6, 0) });
             top.Controls.Add(txtIdentity);
             top.Controls.Add(btnFetch);
@@ -114,9 +153,16 @@ namespace idle_master_game_picker
             tip.SetToolTip(chkIncludeFreeSub, "include_free_sub: include games from free subs, giveaways, trials, etc.");
             tip.SetToolTip(chkSkipUnvetted, "skip_unvetted_apps: when checked, skip unvetted apps; unchecked = include all.");
             tip.SetToolTip(btnAdvancedHelp, "What do these advanced options mean?");
+            tip.SetToolTip(btnForgetTop, "Delete the locally stored encrypted API key and identity, and clear the text fields.");
+            tip.SetToolTip(btnForgetHelp, "What does 'Forget' do?");
+            tip.SetToolTip(btnImportHelp, "What does Import (.csv) do?");
 
             btnAdvancedHelp.Click += (_, __) => ShowAdvancedHelp();
             chkMaxCoverage.CheckedChanged += (_, __) => ApplyMaxCoverageMode();
+
+            // Top-row forget + help handlers
+            btnForgetTop.Click += (_, __) => ForgetSavedCredentials();
+            btnForgetHelp.Click += (_, __) => ShowForgetHelp();
 
             // Apply initial mode (locks the others if enabled)
             ApplyMaxCoverageMode();
@@ -124,9 +170,10 @@ namespace idle_master_game_picker
             // Middle (game list)
             tlp.Controls.Add(clbGames, 0, 2);
 
-            // Bottom row
+            // Bottom row (no Forget button down here)
             var bottom = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Dock = DockStyle.Fill };
             bottom.Controls.Add(btnImportCsv);
+            bottom.Controls.Add(btnImportHelp); // help for Import
             bottom.Controls.Add(btnExport);
             bottom.Controls.Add(lblStatus);
             tlp.Controls.Add(bottom, 0, 3);
@@ -135,6 +182,7 @@ namespace idle_master_game_picker
             btnFetch.Click += async (_, __) => await FetchGamesAsync();
             btnExport.Click += (_, __) => ExportAll();
             btnImportCsv.Click += (_, __) => ImportSelectionsCsv();
+            btnImportHelp.Click += (_, __) => ShowImportHelp();
             txtSearch.TextChanged += (_, __) => ApplyFilter();
             btnSelectAll.Click += (_, __) => SelectAllVisible();
             btnDeselectAll.Click += (_, __) => DeselectAllVisible();
@@ -143,6 +191,9 @@ namespace idle_master_game_picker
 
             txtIdentity.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) btnFetch.PerformClick(); };
             txtApiKey.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) btnFetch.PerformClick(); };
+
+            // Load previously saved (encrypted) credentials on startup
+            TryLoadSavedCredentials();
 
             lblStatus.Text = "Ready";
 
@@ -203,15 +254,13 @@ namespace idle_master_game_picker
 
                 lblStatus.Text = "Fetching games...";
 
-                using var http = new HttpClient();
-
                 var baseUrl = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?";
                 var qp = new List<string>
                 {
                     $"key={Uri.EscapeDataString(key)}",
                     $"steamid={Uri.EscapeDataString(steamId)}",
-                    "include_appinfo=1", // always include names & basic metadata
-                    "language=en"        // fixed to English
+                    "include_appinfo=1",
+                    "language=en"
                 };
 
                 bool includePlayedFree = chkMaxCoverage.Checked ? true : chkIncludePlayedFree.Checked;
@@ -224,13 +273,16 @@ namespace idle_master_game_picker
 
                 var url = baseUrl + string.Join("&", qp);
 
-                var json = await http.GetStringAsync(url);
+                var json = await Http.GetStringAsync(url);
                 var root = JsonSerializer.Deserialize<OwnedGamesRoot>(json);
 
                 allGames = root?.Response?.Games ?? new();
                 selectedAppIds.Clear();
                 ApplyFilter();
                 lblStatus.Text = $"Loaded {allGames.Count} games.";
+
+                // Persist (encrypted) after a successful fetch so user doesn't need to re-enter later
+                SaveCurrentCredentialsIfAny();
             }
             catch (HttpRequestException ex)
             {
@@ -287,9 +339,8 @@ namespace idle_master_game_picker
         {
             try
             {
-                using var http = new HttpClient();
                 var url = $"https://api.steampowered.com/ISteamUser/ResolveVanityURL/v1/?key={Uri.EscapeDataString(apiKey)}&vanityurl={Uri.EscapeDataString(vanity)}";
-                var json = await http.GetStringAsync(url);
+                var json = await Http.GetStringAsync(url);
                 var data = JsonSerializer.Deserialize<VanityRoot>(json);
 
                 if (data?.Response?.Success == 1 && !string.IsNullOrWhiteSpace(data.Response.SteamId))
@@ -336,10 +387,13 @@ namespace idle_master_game_picker
             if (e.Index < 0 || e.Index >= clbGames.Items.Count) return;
             if (clbGames.Items[e.Index] is not GameListItem item) return;
 
+            // Use e.NewValue to capture the upcoming state (CheckedItems updates after the event)
             if (e.NewValue == CheckState.Checked)
                 selectedAppIds.Add(item.Game.AppId);
             else
                 selectedAppIds.Remove(item.Game.AppId);
+
+            lblStatus.Text = $"Selected: {selectedAppIds.Count}";
         }
 
         private void SelectAllVisible()
@@ -354,7 +408,7 @@ namespace idle_master_game_picker
                 }
             }
             clbGames.EndUpdate();
-            lblStatus.Text = $"Selected {clbGames.CheckedItems.Count} visible. Total selected: {selectedAppIds.Count}.";
+            lblStatus.Text = $"Selected {clbGames.Items.Count} visible. Total selected: {selectedAppIds.Count}.";
         }
 
         private void DeselectAllVisible()
@@ -430,15 +484,17 @@ namespace idle_master_game_picker
             ps.AppendLine("    param ($gameList)");
             ps.AppendLine("    foreach ($game in $gameList) {");
             ps.AppendLine("        Write-Host \"$($game.Name) (ID: $($game.ID))\"");
-            ps.AppendLine("        Start-Process -FilePath \"steam-idle.exe\" -ArgumentList $game.ID -WindowStyle Minimized");
+            ps.AppendLine("        $here = Split-Path -Parent $MyInvocation.MyCommand.Path");
+            ps.AppendLine("        $exe  = Join-Path $here 'steam-idle.exe'");
+            ps.AppendLine("        if (-not (Test-Path $exe)) { Write-Error \"steam-idle.exe not found at $exe\"; continue }");
+            ps.AppendLine("        Start-Process -FilePath $exe -ArgumentList $game.ID -WindowStyle Minimized");
             ps.AppendLine("    }");
             ps.AppendLine("    Start-Timer -timeout 3600");
             ps.AppendLine("}");
             ps.AppendLine();
             ps.AppendLine("function Stop-Games {");
             ps.AppendLine("    Write-Host \"Stopping all steam-idle.exe processes...\"");
-            ps.AppendLine("    Stop-Process -Name \"steam-idle\" -Force -ErrorAction SilentlyContinue");
-            ps.AppendLine("    Write-Host \"All steam-idle.exe processes have been stopped.\"");
+            ps.AppendLine("    Get-Process -Name \"steam-idle\" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue");
             ps.AppendLine("    Start-Timer -timeout 30");
             ps.AppendLine("}");
             ps.AppendLine();
@@ -492,6 +548,7 @@ namespace idle_master_game_picker
 title Steam Idle Starter
 chcp 65001 >NUL
 color 0A
+cd /d ""%~dp0""
 echo Starting PowerShell idle script...
 powershell -ExecutionPolicy Bypass -NoProfile -File ""%~dp0games.ps1""
 echo.
@@ -523,17 +580,17 @@ pause";
             int imported = 0;
             try
             {
-                foreach (var line in File.ReadLines(ofd.FileName, new UTF8Encoding(true)))
+                foreach (var raw in File.ReadLines(ofd.FileName, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true)))
                 {
+                    var line = raw.Trim();
                     if (string.IsNullOrWhiteSpace(line)) continue;
 
-                    var trimmed = line.TrimStart();
-                    if (trimmed.StartsWith("appid", StringComparison.OrdinalIgnoreCase))
+                    if (line.StartsWith("appid", StringComparison.OrdinalIgnoreCase))
                         continue;
 
-                    int commaIdx = line.IndexOf(',');
-                    var first = (commaIdx >= 0) ? line.Substring(0, commaIdx) : line;
-                    if (int.TryParse(first.Trim(), out int appId))
+                    // Accept first column as appid and ignore rest
+                    var first = line.Split(',', 2)[0].Trim();
+                    if (int.TryParse(first, out int appId))
                     {
                         if (selectedAppIds.Add(appId)) imported++;
                     }
@@ -553,6 +610,221 @@ pause";
             {
                 MessageBox.Show($"Import failed:\n{ex.Message}", "CSV import error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        // ---------------- Encrypted persistence (DPAPI + machine-specific entropy) ----------------
+
+        /// <summary>
+        /// File path in the user's TEMP folder for storing the encrypted blob.
+        /// </summary>
+        private static string GetStoragePath()
+        {
+            var fn = "idle_master_game_picker.dat";
+            return Path.Combine(Path.GetTempPath(), fn);
+        }
+
+        /// <summary>
+        /// Machine-specific additional entropy (not a secret). Uses MachineGuid if available.
+        /// This ensures the ciphertext is different per machine; user does not need to provide anything.
+        /// </summary>
+        private static byte[] GetMachineEntropy()
+        {
+            try
+            {
+                using var key = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default)
+                                           .OpenSubKey(@"SOFTWARE\Microsoft\Cryptography", false);
+                var mg = key?.GetValue("MachineGuid") as string;
+                if (!string.IsNullOrEmpty(mg))
+                    return Encoding.UTF8.GetBytes(mg);
+            }
+            catch
+            {
+                // Fall through to fallback entropy
+            }
+
+            // Fallback: combine a few machine characteristics. This is not a secret, just diversification.
+            var fallback = Environment.MachineName + "|" + Environment.ProcessorCount + "|" + Environment.OSVersion.VersionString;
+            return Encoding.UTF8.GetBytes(fallback);
+        }
+
+        private class PersistedCredentials
+        {
+            public string? ApiKey { get; set; }
+            public string? Identity { get; set; }
+        }
+
+        /// <summary>
+        /// Encrypt and save API key + identity into TEMP as Base64 blob using DPAPI (LocalMachine scope).
+        /// LocalMachine scope means any user account on the same machine can decrypt (by design).
+        /// </summary>
+        private void SaveCredentialsEncrypted(string apiKey, string identity)
+        {
+            try
+            {
+                var creds = new PersistedCredentials { ApiKey = apiKey, Identity = identity };
+                var json = JsonSerializer.Serialize(creds);
+                var plain = Encoding.UTF8.GetBytes(json);
+
+                var entropy = GetMachineEntropy();
+                var encrypted = ProtectedData.Protect(plain, entropy, DataProtectionScope.LocalMachine);
+                var b64 = Convert.ToBase64String(encrypted);
+
+                File.WriteAllText(GetStoragePath(), b64, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+                lblStatus.Text = "Encrypted settings saved.";
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Saving settings failed:\n{ex.Message}", "Save error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                lblStatus.Text = "Save failed.";
+            }
+        }
+
+        /// <summary>
+        /// Try to load and decrypt previously saved credentials. Returns (null, null) if unavailable.
+        /// </summary>
+        private (string? apiKey, string? identity) LoadCredentialsEncrypted()
+        {
+            try
+            {
+                var path = GetStoragePath();
+                if (!File.Exists(path)) return (null, null);
+
+                var b64 = File.ReadAllText(path, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true)).Trim();
+                if (string.IsNullOrEmpty(b64)) return (null, null);
+
+                var encrypted = Convert.FromBase64String(b64);
+                var entropy = GetMachineEntropy();
+                var plain = ProtectedData.Unprotect(encrypted, entropy, DataProtectionScope.LocalMachine);
+                var json = Encoding.UTF8.GetString(plain);
+
+                var creds = JsonSerializer.Deserialize<PersistedCredentials>(json);
+                lblStatus.Text = "Encrypted settings loaded.";
+                return (creds?.ApiKey, creds?.Identity);
+            }
+            catch (CryptographicException)
+            {
+                // Usually indicates wrong machine/scope or corrupted file. Delete to avoid repeated errors.
+                try { File.Delete(GetStoragePath()); } catch { }
+                lblStatus.Text = "Saved settings could not be decrypted (machine-specific key mismatch).";
+                return (null, null);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Loading settings failed:\n{ex.Message}", "Load error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                lblStatus.Text = "Load failed.";
+                return (null, null);
+            }
+        }
+
+        /// <summary>
+        /// Delete the stored encrypted file.
+        /// </summary>
+        private void DeleteStoredCredentials()
+        {
+            try
+            {
+                var p = GetStoragePath();
+                if (File.Exists(p)) File.Delete(p);
+                lblStatus.Text = "Saved credentials removed.";
+            }
+            catch
+            {
+                lblStatus.Text = "Failed to remove saved credentials.";
+            }
+        }
+
+        /// <summary>
+        /// Attempt to load saved credentials into the UI on startup.
+        /// </summary>
+        private void TryLoadSavedCredentials()
+        {
+            var (apiKey, identity) = LoadCredentialsEncrypted();
+            if (!string.IsNullOrEmpty(apiKey)) txtApiKey.Text = apiKey;
+            if (!string.IsNullOrEmpty(identity)) txtIdentity.Text = identity;
+        }
+
+        /// <summary>
+        /// Save current textbox values if present.
+        /// </summary>
+        private void SaveCurrentCredentialsIfAny()
+        {
+            var key = txtApiKey.Text?.Trim();
+            var id = txtIdentity.Text?.Trim();
+            if (!string.IsNullOrEmpty(key) || !string.IsNullOrEmpty(id))
+            {
+                SaveCredentialsEncrypted(key ?? "", id ?? "");
+            }
+        }
+
+        /// <summary>
+        /// UI handler to forget (delete) saved credentials and clear textboxes.
+        /// </summary>
+        private void ForgetSavedCredentials()
+        {
+            DeleteStoredCredentials();
+            txtApiKey.Clear();
+            txtIdentity.Clear();
+            lblStatus.Text = "Saved credentials forgotten.";
+        }
+
+        /// <summary>
+        /// Show a help dialog explaining what the Steam API key is, where to get it, and what 'Forget' does.
+        /// </summary>
+        private void ShowForgetHelp()
+        {
+            var text =
+@"About Steam Web API key and 'Forget' option
+
+► What is the Steam Web API key?
+  The API key is a unique identifier that allows this app to
+  securely request your public Steam data (like your owned games).
+  It is tied to your Steam account but it does NOT give full access
+  to your account or library — it’s read-only.
+
+► Where can I get it?
+  1. Go to https://steamcommunity.com/dev/apikey while logged in.
+  2. If you haven’t created one before, enter any domain name (for example 'localhost')
+     and click ‘Register’.
+  3. Copy the key shown on that page and paste it into the
+     'Steam Web API key' field in this app.
+
+► What does 'Forget saved credentials' do?
+  • Deletes the local encrypted file that stores your API key and ID
+    (saved in your TEMP folder as idle_master_game_picker.dat).
+  • Clears the API key and identity fields in this window.
+  • Does NOT contact Steam or revoke your key online — it only
+    removes local data on this computer.
+  • After forgetting, you can always re-enter your key again later.";
+
+            MessageBox.Show(this, text, "About Steam API key and 'Forget' option", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        /// <summary>
+        /// Explain what the Import (.csv) button does and how to use it.
+        /// </summary>
+        private void ShowImportHelp()
+        {
+            var text =
+@"About 'Import selections (.csv)'
+
+► What it does:
+  This button lets you import a list of previously saved games
+  from a CSV file (for example, one created by this app's Export feature).
+
+► How to use it:
+  1. Click 'Export' in this app to generate 'selected_games.csv'.
+  2. Later, or on another computer, click 'Import (.csv)' and
+     select that same file.
+  3. The app will automatically check those games in the list
+     if they exist in your Steam library.
+
+► Notes:
+  • The file must have a column named 'appid' (the Steam AppID).
+  • Duplicate entries are ignored automatically.
+  • Import only affects the local selection — it does NOT modify
+    your Steam account or any external data.";
+
+            MessageBox.Show(this, text, "About Import (.csv)", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
         // ---------------- Helpers ----------------
@@ -589,17 +861,17 @@ pause";
             var text =
 @"Advanced parameters for IPlayerService/GetOwnedGames/v1:
 
-� Return ALL owned (master switch)
+• Return ALL owned (master switch)
   When ON (default): forces include_played_free_games=1, include_free_sub=1,
   and skip_unvetted_apps=false, and locks the three options below.
 
-� include_played_free_games
+• include_played_free_games
   Includes Free-to-Play titles that you have played (claimed/initialized).
 
-� include_free_sub
+• include_free_sub
   Includes games tied to free subscriptions, giveaways, trials, or betas.
 
-� skip_unvetted_apps
+• skip_unvetted_apps
   If true, the API skips unvetted/less-public apps.
   Leave unchecked to include as much as possible.";
             MessageBox.Show(this, text, "About Advanced Options", MessageBoxButtons.OK, MessageBoxIcon.Information);
