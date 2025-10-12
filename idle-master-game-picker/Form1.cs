@@ -37,7 +37,7 @@ namespace idle_master_game_picker
             Margin = new Padding(2, 2, 0, 0)
         };
 
-        // --- Bottom controls (no Forget button here) ---
+        // --- Bottom controls ---
         private readonly Button btnImportCsv = new() { Text = "Import selections (.csv)" };
         private readonly Button btnExport = new() { Text = "Export (games.ps1 + start.bat + selected_games.csv)" };
         private readonly Button btnImportHelp = new()
@@ -49,6 +49,41 @@ namespace idle_master_game_picker
             Margin = new Padding(2, 2, 0, 0)
         };
         private readonly Label lblStatus = new() { AutoSize = true };
+
+        // Group size selector 1–32
+        private readonly NumericUpDown nudGroupSize = new()
+        {
+            Minimum = 1,
+            Maximum = 32,
+            Value = 30,
+            DecimalPlaces = 0,
+            Increment = 1,
+            Width = 60
+        };
+        private readonly Label lblGroupSize = new() { Text = "Games per group:", AutoSize = true, Padding = new Padding(12, 6, 6, 0) };
+
+        // NEW: per-category run seconds (1..86400) and cooldown seconds (0..3600)
+        private readonly NumericUpDown nudRunSeconds = new()
+        {
+            Minimum = 1,
+            Maximum = 86400, // 24h
+            Value = 3600,
+            DecimalPlaces = 0,
+            Increment = 60,
+            Width = 80
+        };
+        private readonly Label lblRunSeconds = new() { Text = "Run seconds:", AutoSize = true, Padding = new Padding(12, 6, 6, 0) };
+
+        private readonly NumericUpDown nudCooldownSeconds = new()
+        {
+            Minimum = 0,
+            Maximum = 3600,
+            Value = 30,
+            DecimalPlaces = 0,
+            Increment = 5,
+            Width = 80
+        };
+        private readonly Label lblCooldownSeconds = new() { Text = "Cooldown seconds:", AutoSize = true, Padding = new Padding(12, 6, 6, 0) };
 
         // --- Advanced parameter controls ---
         private readonly CheckBox chkMaxCoverage = new()
@@ -82,8 +117,9 @@ namespace idle_master_game_picker
         // --- In-memory state ---
         private List<Game> allGames = new();
         private readonly HashSet<int> selectedAppIds = new(); // persistent selection across filters
+        private bool _suppressItemCheck; // prevents double-counting on programmatic checks
 
-        // --- Reused HttpClient to avoid socket exhaustion ---
+        // --- Reused HttpClient ---
         private static readonly HttpClient Http = new()
         {
             Timeout = TimeSpan.FromSeconds(30)
@@ -93,11 +129,10 @@ namespace idle_master_game_picker
         {
             InitializeComponent();
             Text = "Idle Master Game Picker";
-            Width = 980;
-            Height = 720;
+            Width = 1100;
+            Height = 740;
             StartPosition = FormStartPosition.CenterScreen;
 
-            // Optional: set a User-Agent so your requests are easy to identify server-side
             try { Http.DefaultRequestHeaders.UserAgent.ParseAdd("IdleMasterGamePicker/1.0 (+winforms)"); } catch { }
 
             // Layout root
@@ -118,14 +153,9 @@ namespace idle_master_game_picker
             var top = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Dock = DockStyle.Fill };
             top.Controls.Add(new Label { Text = "API key:", AutoSize = true, Padding = new Padding(0, 6, 6, 0) });
             top.Controls.Add(txtApiKey);
-
-            // Mask API key visually so it appears like a password field (********)
             txtApiKey.UseSystemPasswordChar = true;
-
-            // Add small "Forget" + "?" near the API key
             top.Controls.Add(btnForgetTop);
             top.Controls.Add(btnForgetHelp);
-
             top.Controls.Add(new Label { Text = "Steam ID / URL / Vanity:", AutoSize = true, Padding = new Padding(12, 6, 6, 0) });
             top.Controls.Add(txtIdentity);
             top.Controls.Add(btnFetch);
@@ -135,10 +165,9 @@ namespace idle_master_game_picker
             top.Controls.Add(btnClearAll);
             tlp.Controls.Add(top, 0, 0);
 
-            // Advanced row (optional parameters)
+            // Advanced row
             var advanced = new GroupBox { Text = "Advanced (optional)", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
             var advFlow = new FlowLayoutPanel { AutoSize = true, WrapContents = true, Dock = DockStyle.Fill, Padding = new Padding(6) };
-
             advFlow.Controls.Add(chkMaxCoverage);
             advFlow.Controls.Add(chkIncludePlayedFree);
             advFlow.Controls.Add(chkIncludeFreeSub);
@@ -156,29 +185,39 @@ namespace idle_master_game_picker
             tip.SetToolTip(btnForgetTop, "Delete the locally stored encrypted API key and identity, and clear the text fields.");
             tip.SetToolTip(btnForgetHelp, "What does 'Forget' do?");
             tip.SetToolTip(btnImportHelp, "What does Import (.csv) do?");
+            tip.SetToolTip(nudGroupSize, "How many games per category in the exported PowerShell script (1–32).");
+            tip.SetToolTip(nudRunSeconds, "How long to run each category (in seconds).");
+            tip.SetToolTip(nudCooldownSeconds, "Pause between categories (in seconds).");
 
             btnAdvancedHelp.Click += (_, __) => ShowAdvancedHelp();
             chkMaxCoverage.CheckedChanged += (_, __) => ApplyMaxCoverageMode();
-
-            // Top-row forget + help handlers
             btnForgetTop.Click += (_, __) => ForgetSavedCredentials();
             btnForgetHelp.Click += (_, __) => ShowForgetHelp();
 
-            // Apply initial mode (locks the others if enabled)
             ApplyMaxCoverageMode();
 
-            // Middle (game list)
+            // Middle
             tlp.Controls.Add(clbGames, 0, 2);
 
-            // Bottom row (no Forget button down here)
+            // Bottom row
             var bottom = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Dock = DockStyle.Fill };
             bottom.Controls.Add(btnImportCsv);
-            bottom.Controls.Add(btnImportHelp); // help for Import
+            bottom.Controls.Add(btnImportHelp);
+
+            bottom.Controls.Add(lblGroupSize);
+            bottom.Controls.Add(nudGroupSize);
+
+            bottom.Controls.Add(lblRunSeconds);
+            bottom.Controls.Add(nudRunSeconds);
+
+            bottom.Controls.Add(lblCooldownSeconds);
+            bottom.Controls.Add(nudCooldownSeconds);
+
             bottom.Controls.Add(btnExport);
             bottom.Controls.Add(lblStatus);
             tlp.Controls.Add(bottom, 0, 3);
 
-            // Event hookups
+            // Events
             btnFetch.Click += async (_, __) => await FetchGamesAsync();
             btnExport.Click += (_, __) => ExportAll();
             btnImportCsv.Click += (_, __) => ImportSelectionsCsv();
@@ -192,7 +231,6 @@ namespace idle_master_game_picker
             txtIdentity.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) btnFetch.PerformClick(); };
             txtApiKey.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) btnFetch.PerformClick(); };
 
-            // Load previously saved (encrypted) credentials on startup
             TryLoadSavedCredentials();
 
             lblStatus.Text = "Ready";
@@ -202,7 +240,6 @@ namespace idle_master_game_picker
             FixLayout();
         }
 
-        // Locks/unlocks advanced toggles and forces values when max coverage is on
         private void ApplyMaxCoverageMode()
         {
             if (chkMaxCoverage.Checked)
@@ -221,7 +258,6 @@ namespace idle_master_game_picker
                 chkIncludeFreeSub.Enabled = true;
                 chkSkipUnvetted.Enabled = true;
             }
-
             ApplyFilter();
         }
 
@@ -281,7 +317,6 @@ namespace idle_master_game_picker
                 ApplyFilter();
                 lblStatus.Text = $"Loaded {allGames.Count} games.";
 
-                // Persist (encrypted) after a successful fetch so user doesn't need to re-enter later
                 SaveCurrentCredentialsIfAny();
             }
             catch (HttpRequestException ex)
@@ -367,6 +402,7 @@ namespace idle_master_game_picker
 
             var ordered = view.OrderBy(g => g.Name ?? "", StringComparer.CurrentCultureIgnoreCase).ToList();
 
+            _suppressItemCheck = true;
             clbGames.BeginUpdate();
             clbGames.Items.Clear();
             foreach (var g in ordered)
@@ -376,6 +412,7 @@ namespace idle_master_game_picker
                 clbGames.Items.Add(item, isChecked);
             }
             clbGames.EndUpdate();
+            _suppressItemCheck = false;
 
             lblStatus.Text = string.IsNullOrEmpty(q)
                 ? $"Loaded {allGames.Count} games. Selected {selectedAppIds.Count}."
@@ -384,10 +421,10 @@ namespace idle_master_game_picker
 
         private void ClbGames_ItemCheck(object? sender, ItemCheckEventArgs e)
         {
+            if (_suppressItemCheck) return;
             if (e.Index < 0 || e.Index >= clbGames.Items.Count) return;
             if (clbGames.Items[e.Index] is not GameListItem item) return;
 
-            // Use e.NewValue to capture the upcoming state (CheckedItems updates after the event)
             if (e.NewValue == CheckState.Checked)
                 selectedAppIds.Add(item.Game.AppId);
             else
@@ -398,6 +435,7 @@ namespace idle_master_game_picker
 
         private void SelectAllVisible()
         {
+            _suppressItemCheck = true;
             clbGames.BeginUpdate();
             for (int i = 0; i < clbGames.Items.Count; i++)
             {
@@ -408,11 +446,13 @@ namespace idle_master_game_picker
                 }
             }
             clbGames.EndUpdate();
+            _suppressItemCheck = false;
             lblStatus.Text = $"Selected {clbGames.Items.Count} visible. Total selected: {selectedAppIds.Count}.";
         }
 
         private void DeselectAllVisible()
         {
+            _suppressItemCheck = true;
             clbGames.BeginUpdate();
             for (int i = 0; i < clbGames.Items.Count; i++)
             {
@@ -423,16 +463,19 @@ namespace idle_master_game_picker
                 }
             }
             clbGames.EndUpdate();
+            _suppressItemCheck = false;
             lblStatus.Text = $"Deselected visible. Total selected: {selectedAppIds.Count}.";
         }
 
         private void ClearAllSelections()
         {
             selectedAppIds.Clear();
+            _suppressItemCheck = true;
             clbGames.BeginUpdate();
             for (int i = 0; i < clbGames.Items.Count; i++)
                 clbGames.SetItemChecked(i, false);
             clbGames.EndUpdate();
+            _suppressItemCheck = false;
             lblStatus.Text = "All selections cleared.";
         }
 
@@ -457,16 +500,19 @@ namespace idle_master_game_picker
                 return;
             }
 
+            int groupSize = Math.Max(1, Math.Min(32, (int)nudGroupSize.Value));
+            int runSeconds = Math.Max(1, Math.Min(86400, (int)nudRunSeconds.Value));
+            int cooldownSeconds = Math.Max(0, Math.Min(3600, (int)nudCooldownSeconds.Value));
+
             var ps = new StringBuilder();
             ps.AppendLine("# Auto-generated by Steam Games Picker");
             ps.AppendLine("$gameCategories = @(");
 
-            var chunks = Chunk(selected, 30).ToList();
+            var chunks = Chunk(selected, groupSize).ToList();
             for (int ci = 0; ci < chunks.Count; ci++)
             {
                 var chunk = chunks[ci];
                 ps.AppendLine("    @(");
-
                 for (int gi = 0; gi < chunk.Count; gi++)
                 {
                     var g = chunk[gi];
@@ -474,30 +520,47 @@ namespace idle_master_game_picker
                     var comma = (gi < chunk.Count - 1) ? "," : "";
                     ps.AppendLine($"        @{{Name='{safe}'; ID={g.AppId}}}{comma}");
                 }
-
                 var chunkComma = (ci < chunks.Count - 1) ? "," : "";
                 ps.AppendLine($"    ){chunkComma}");
             }
             ps.AppendLine(")");
             ps.AppendLine();
+
+            // Inject configurable timers
+            ps.AppendLine($"$runSeconds = {runSeconds}");
+            ps.AppendLine($"$cooldownSeconds = {cooldownSeconds}");
+            ps.AppendLine();
+
+            // Robust script directory preamble
+            ps.AppendLine("# Resolve script directory robustly");
+            ps.AppendLine("$script:Here = $PSScriptRoot");
+            ps.AppendLine("if (-not $script:Here -or [string]::IsNullOrWhiteSpace($script:Here)) {");
+            ps.AppendLine("    if ($PSCommandPath) { $script:Here = Split-Path -Parent $PSCommandPath }");
+            ps.AppendLine("}");
+            ps.AppendLine("if (-not $script:Here -or [string]::IsNullOrWhiteSpace($script:Here)) {");
+            ps.AppendLine("    $script:Here = (Get-Location).Path");
+            ps.AppendLine("}");
+            ps.AppendLine();
+
             ps.AppendLine("function Start-Games {");
             ps.AppendLine("    param ($gameList)");
             ps.AppendLine("    foreach ($game in $gameList) {");
             ps.AppendLine("        Write-Host \"$($game.Name) (ID: $($game.ID))\"");
-            ps.AppendLine("        $here = Split-Path -Parent $MyInvocation.MyCommand.Path");
-            ps.AppendLine("        $exe  = Join-Path $here 'steam-idle.exe'");
+            ps.AppendLine("        $exe  = Join-Path $script:Here 'steam-idle.exe'");
             ps.AppendLine("        if (-not (Test-Path $exe)) { Write-Error \"steam-idle.exe not found at $exe\"; continue }");
             ps.AppendLine("        Start-Process -FilePath $exe -ArgumentList $game.ID -WindowStyle Minimized");
             ps.AppendLine("    }");
-            ps.AppendLine("    Start-Timer -timeout 3600");
+            ps.AppendLine("    Start-Timer -timeout $runSeconds");
             ps.AppendLine("}");
             ps.AppendLine();
+
             ps.AppendLine("function Stop-Games {");
             ps.AppendLine("    Write-Host \"Stopping all steam-idle.exe processes...\"");
             ps.AppendLine("    Get-Process -Name \"steam-idle\" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue");
-            ps.AppendLine("    Start-Timer -timeout 30");
+            ps.AppendLine("    Start-Timer -timeout $cooldownSeconds");
             ps.AppendLine("}");
             ps.AppendLine();
+
             ps.AppendLine("function Start-Timer {");
             ps.AppendLine("    param ([int]$timeout)");
             ps.AppendLine("    $elapsed = 0");
@@ -517,6 +580,7 @@ namespace idle_master_game_picker
             ps.AppendLine("    Write-Host \"Proceeding to the next step...\"");
             ps.AppendLine("}");
             ps.AppendLine();
+
             ps.AppendLine("while ($true) {");
             ps.AppendLine("    foreach ($gameList in $gameCategories) {");
             ps.AppendLine("        Clear-Host");
@@ -555,7 +619,6 @@ echo.
 pause";
             File.WriteAllText(batPath, batContent, new UTF8Encoding(false));
 
-            // Ensure UTF-8 output in PS for non-ASCII names
             var csvText = csv.ToString();
             File.WriteAllText(csvPath, csvText, new UTF8Encoding(true));
 
@@ -564,6 +627,8 @@ pause";
                 "Export complete",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
+
+            lblStatus.Text = $"Exported {selected.Count} games in {chunks.Count} groups (size {groupSize}). Run {runSeconds}s, cooldown {cooldownSeconds}s.";
         }
 
         private void ImportSelectionsCsv()
@@ -588,7 +653,6 @@ pause";
                     if (line.StartsWith("appid", StringComparison.OrdinalIgnoreCase))
                         continue;
 
-                    // Accept first column as appid and ignore rest
                     var first = line.Split(',', 2)[0].Trim();
                     if (int.TryParse(first, out int appId))
                     {
@@ -596,6 +660,7 @@ pause";
                     }
                 }
 
+                _suppressItemCheck = true;
                 clbGames.BeginUpdate();
                 for (int i = 0; i < clbGames.Items.Count; i++)
                 {
@@ -603,6 +668,7 @@ pause";
                         clbGames.SetItemChecked(i, selectedAppIds.Contains(item.Game.AppId));
                 }
                 clbGames.EndUpdate();
+                _suppressItemCheck = false;
 
                 lblStatus.Text = $"Imported {imported} appIDs from CSV. Total selected: {selectedAppIds.Count}.";
             }
@@ -614,19 +680,12 @@ pause";
 
         // ---------------- Encrypted persistence (DPAPI + machine-specific entropy) ----------------
 
-        /// <summary>
-        /// File path in the user's TEMP folder for storing the encrypted blob.
-        /// </summary>
         private static string GetStoragePath()
         {
             var fn = "idle_master_game_picker.dat";
             return Path.Combine(Path.GetTempPath(), fn);
         }
 
-        /// <summary>
-        /// Machine-specific additional entropy (not a secret). Uses MachineGuid if available.
-        /// This ensures the ciphertext is different per machine; user does not need to provide anything.
-        /// </summary>
         private static byte[] GetMachineEntropy()
         {
             try
@@ -637,12 +696,8 @@ pause";
                 if (!string.IsNullOrEmpty(mg))
                     return Encoding.UTF8.GetBytes(mg);
             }
-            catch
-            {
-                // Fall through to fallback entropy
-            }
+            catch { }
 
-            // Fallback: combine a few machine characteristics. This is not a secret, just diversification.
             var fallback = Environment.MachineName + "|" + Environment.ProcessorCount + "|" + Environment.OSVersion.VersionString;
             return Encoding.UTF8.GetBytes(fallback);
         }
@@ -653,10 +708,6 @@ pause";
             public string? Identity { get; set; }
         }
 
-        /// <summary>
-        /// Encrypt and save API key + identity into TEMP as Base64 blob using DPAPI (LocalMachine scope).
-        /// LocalMachine scope means any user account on the same machine can decrypt (by design).
-        /// </summary>
         private void SaveCredentialsEncrypted(string apiKey, string identity)
         {
             try
@@ -679,9 +730,6 @@ pause";
             }
         }
 
-        /// <summary>
-        /// Try to load and decrypt previously saved credentials. Returns (null, null) if unavailable.
-        /// </summary>
         private (string? apiKey, string? identity) LoadCredentialsEncrypted()
         {
             try
@@ -703,7 +751,6 @@ pause";
             }
             catch (CryptographicException)
             {
-                // Usually indicates wrong machine/scope or corrupted file. Delete to avoid repeated errors.
                 try { File.Delete(GetStoragePath()); } catch { }
                 lblStatus.Text = "Saved settings could not be decrypted (machine-specific key mismatch).";
                 return (null, null);
@@ -716,9 +763,6 @@ pause";
             }
         }
 
-        /// <summary>
-        /// Delete the stored encrypted file.
-        /// </summary>
         private void DeleteStoredCredentials()
         {
             try
@@ -733,9 +777,6 @@ pause";
             }
         }
 
-        /// <summary>
-        /// Attempt to load saved credentials into the UI on startup.
-        /// </summary>
         private void TryLoadSavedCredentials()
         {
             var (apiKey, identity) = LoadCredentialsEncrypted();
@@ -743,9 +784,6 @@ pause";
             if (!string.IsNullOrEmpty(identity)) txtIdentity.Text = identity;
         }
 
-        /// <summary>
-        /// Save current textbox values if present.
-        /// </summary>
         private void SaveCurrentCredentialsIfAny()
         {
             var key = txtApiKey.Text?.Trim();
@@ -756,9 +794,6 @@ pause";
             }
         }
 
-        /// <summary>
-        /// UI handler to forget (delete) saved credentials and clear textboxes.
-        /// </summary>
         private void ForgetSavedCredentials()
         {
             DeleteStoredCredentials();
@@ -767,9 +802,6 @@ pause";
             lblStatus.Text = "Saved credentials forgotten.";
         }
 
-        /// <summary>
-        /// Show a help dialog explaining what the Steam API key is, where to get it, and what 'Forget' does.
-        /// </summary>
         private void ShowForgetHelp()
         {
             var text =
@@ -795,13 +827,9 @@ pause";
   • Does NOT contact Steam or revoke your key online — it only
     removes local data on this computer.
   • After forgetting, you can always re-enter your key again later.";
-
             MessageBox.Show(this, text, "About Steam API key and 'Forget' option", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
-        /// <summary>
-        /// Explain what the Import (.csv) button does and how to use it.
-        /// </summary>
         private void ShowImportHelp()
         {
             var text =
@@ -823,7 +851,6 @@ pause";
   • Duplicate entries are ignored automatically.
   • Import only affects the local selection — it does NOT modify
     your Steam account or any external data.";
-
             MessageBox.Show(this, text, "About Import (.csv)", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
@@ -848,7 +875,6 @@ pause";
         {
             public Game Game { get; }
             public GameListItem(Game g) => Game = g;
-
             public override string ToString()
             {
                 var name = string.IsNullOrWhiteSpace(Game.Name) ? $"App {Game.AppId}" : Game.Name;
@@ -916,8 +942,11 @@ pause";
                     case CheckBox ck:
                         ck.ForeColor = Color.Gainsboro;
                         break;
+                    case NumericUpDown nud:
+                        nud.BackColor = Color.FromArgb(50, 50, 55);
+                        nud.ForeColor = Color.WhiteSmoke;
+                        break;
                 }
-
                 if (c.HasChildren)
                     ApplyDarkThemeRecursive(c);
             }
