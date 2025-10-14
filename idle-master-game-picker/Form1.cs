@@ -312,7 +312,16 @@ namespace idle_master_game_picker
                 var json = await Http.GetStringAsync(url);
                 var root = JsonSerializer.Deserialize<OwnedGamesRoot>(json);
 
-                allGames = root?.Response?.Games ?? new();
+                if (root?.Response?.Games == null)
+                {
+                    allGames = new();
+                    selectedAppIds.Clear();
+                    ApplyFilter();
+                    lblStatus.Text = "No games found.";
+                    return;
+                }
+
+                allGames = root.Response.Games;
                 selectedAppIds.Clear();
                 ApplyFilter();
                 lblStatus.Text = $"Loaded {allGames.Count} games.";
@@ -526,6 +535,19 @@ namespace idle_master_game_picker
             ps.AppendLine(")");
             ps.AppendLine();
 
+            // --- Normalize to array-of-arrays (fix single-category/flattened case) ---
+            ps.AppendLine("# --- Normalize to array-of-arrays (fix single-category/flattened case) ---");
+            ps.AppendLine("if ($gameCategories.Count -gt 0) {");
+            ps.AppendLine("    $first = $gameCategories[0]");
+            ps.AppendLine("    if ($first -is [hashtable] -and $first.ContainsKey('ID')) {");
+            ps.AppendLine("        $gameCategories = ,@($gameCategories)");
+            ps.AppendLine("    }");
+            ps.AppendLine("    elseif ($first -is [pscustomobject] -and ($first | Get-Member -Name ID -MemberType NoteProperty)) {");
+            ps.AppendLine("        $gameCategories = ,@($gameCategories)");
+            ps.AppendLine("    }");
+            ps.AppendLine("}");
+            ps.AppendLine();
+
             // Inject configurable timers
             ps.AppendLine($"$runSeconds = {runSeconds}");
             ps.AppendLine($"$cooldownSeconds = {cooldownSeconds}");
@@ -542,14 +564,33 @@ namespace idle_master_game_picker
             ps.AppendLine("}");
             ps.AppendLine();
 
+            // Start-Games: launch ALL games in category at once (also when only one category exists)
             ps.AppendLine("function Start-Games {");
             ps.AppendLine("    param ($gameList)");
-            ps.AppendLine("    foreach ($game in $gameList) {");
-            ps.AppendLine("        Write-Host \"$($game.Name) (ID: $($game.ID))\"");
-            ps.AppendLine("        $exe  = Join-Path $script:Here 'steam-idle.exe'");
-            ps.AppendLine("        if (-not (Test-Path $exe)) { Write-Error \"steam-idle.exe not found at $exe\"; continue }");
-            ps.AppendLine("        Start-Process -FilePath $exe -ArgumentList $game.ID -WindowStyle Minimized");
+            ps.AppendLine();
+            ps.AppendLine("    # Ensure we have a concrete array of games");
+            ps.AppendLine("    $list = @($gameList)");
+            ps.AppendLine("    Write-Host (\"Items in this category: {0}\" -f $list.Count)");
+            ps.AppendLine();
+            ps.AppendLine("    $exe  = Join-Path $script:Here 'steam-idle.exe'");
+            ps.AppendLine("    if (-not (Test-Path $exe)) {");
+            ps.AppendLine("        Write-Error \"steam-idle.exe not found at $exe\"");
+            ps.AppendLine("        return");
             ps.AppendLine("    }");
+            ps.AppendLine();
+            ps.AppendLine("    $launched = @()");
+            ps.AppendLine("    foreach ($game in $list) {");
+            ps.AppendLine("        Write-Host (\"{0} (ID: {1})...\" -f $game.Name, $game.ID)");
+            ps.AppendLine("        $p = Start-Process -FilePath $exe -ArgumentList $game.ID -WindowStyle Minimized -PassThru -ErrorAction SilentlyContinue");
+            ps.AppendLine("        if ($p) { $launched += $p }");
+            ps.AppendLine("        Start-Sleep -Milliseconds 150  # small gap so process creation won't choke");
+            ps.AppendLine("    }");
+            ps.AppendLine();
+            ps.AppendLine("    if ($launched.Count -gt 0) {");
+            ps.AppendLine("        Write-Host (\"Launched in this category: {0}, running now:\" -f $launched.Count)");
+            ps.AppendLine("        $launched | ForEach-Object { Write-Host (\" - PID {0}\" -f $_.Id) }");
+            ps.AppendLine("    }");
+            ps.AppendLine();
             ps.AppendLine("    Start-Timer -timeout $runSeconds");
             ps.AppendLine("}");
             ps.AppendLine();
@@ -653,7 +694,7 @@ pause";
                     if (line.StartsWith("appid", StringComparison.OrdinalIgnoreCase))
                         continue;
 
-                    var first = line.Split(',', 2)[0].Trim();
+                    var first = line.Split(',', 2)[0].Trim().Trim('"');
                     if (int.TryParse(first, out int appId))
                     {
                         if (selectedAppIds.Add(appId)) imported++;
