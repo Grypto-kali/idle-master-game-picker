@@ -5,7 +5,8 @@ It generates ready-to-use scripts (`games.ps1`, `start.bat`, and `selected_games
 for use with **[Idle Master Extended](https://github.com/JonasNilson/idle_master_extended)** or **steam-idle.exe**.
 
 ---
-<img width="1909" height="1037" alt="image" src="https://github.com/user-attachments/assets/5ae2409b-ded9-4683-826c-1c20fc2a0511" />
+<img width="1910" height="1033" alt="image" src="https://github.com/user-attachments/assets/a7434bea-2116-4ea4-9380-a6864382622f" />
+
 
 ## 📥 Download
 
